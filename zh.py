@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Zone‑H Domain Grabber – Mass Version
+Zone‑H Domain Grabber – Mass Version with Centralized Captcha Handling
 Supports single attacker or list from file, optional multithreading.
+Only one captcha prompt will appear, and all threads will resume safely.
 """
 
 import requests
@@ -12,6 +13,7 @@ import os
 import sys
 import time
 import random
+import threading
 from colorama import Fore, Style, init
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -49,9 +51,65 @@ def banner():
     print(C + Style.BRIGHT + "=" * 60)
     print(G + "  Zone‑H Domain Grabber (Mass Edition)")
     print(C + "=" * 60)
-    print(Y + "  Captcha auto‑handler  |  No IPs, no ellipsis")
+    print(Y + "  Centralized Captcha  |  No IPs, no ellipsis")
     print("")
 
+# ────────────────────────── CAPTCHA HANDLER ──────────────────────────
+class CaptchaHandler:
+    """
+    Shared captcha handler for all threads.
+    Only one prompt will appear at a time.
+    """
+    def __init__(self, initial_cookies):
+        self.cookies = initial_cookies.copy()
+        self.lock = threading.Lock()
+        self.captcha_event = threading.Event()  # set when captcha is detected
+        self.new_cookies_event = threading.Event()  # set when new cookies are ready
+
+    def wait_if_captcha(self):
+        """Called before any request: if a captcha was reported, wait until resolved."""
+        if self.captcha_event.is_set():
+            self.new_cookies_event.wait()  # blocks until new cookies are applied
+
+    def report_captcha(self):
+        """
+        Called by a thread that detected captcha.
+        If this is the first to report, show the prompt and update cookies.
+        """
+        with self.lock:
+            # Only the first thread that gets the lock will handle the prompt
+            if not self.captcha_event.is_set():
+                self.captcha_event.set()   # signal all other threads to stop
+                self.new_cookies_event.clear()
+                print(Y + "\n[!] CAPTCHA detected! Please solve it in your browser and paste new cookies.")
+                new_cookie_str = input(W + "Paste new cookies (Format: PHPSESSID=...; ZHE=...): ").strip()
+                new_cookies = parse_cookies(new_cookie_str)
+                # Validate
+                while 'PHPSESSID' not in new_cookies or 'ZHE' not in new_cookies:
+                    print(R + "[!] Must contain PHPSESSID and ZHE. Try again.")
+                    new_cookie_str = input(W + "Paste new cookies: ").strip()
+                    new_cookies = parse_cookies(new_cookie_str)
+                # Update shared cookies
+                self.cookies = new_cookies.copy()
+                print(G + "[+] Cookies updated globally. Resuming all threads...")
+                self.captcha_event.clear()
+                self.new_cookies_event.set()   # release waiting threads
+                time.sleep(0.5)  # small delay to let threads pick up the change
+                # Clear the new_cookies_event after a moment to avoid stale state
+                self.new_cookies_event.clear()
+            else:
+                # If another thread already reported, just wait here until resolved
+                self.new_cookies_event.wait()
+                self.new_cookies_event.clear()
+
+    def update_session_cookies(self, session):
+        """Sync a session's cookies with the current global cookies."""
+        with self.lock:
+            session.cookies.clear()
+            for k, v in self.cookies.items():
+                session.cookies.set(k, v)
+
+# ─────────────────────────── HELPER FUNCTIONS ───────────────────────────
 def parse_cookies(cookie_str):
     cookies = {}
     for part in cookie_str.split(';'):
@@ -126,7 +184,11 @@ def extract_domains_regex(html):
                     domains.append(candidate)
     return domains
 
-def fetch_page(session, url):
+def fetch_page(session, url, captcha_handler):
+    """
+    Fetch a page. If captcha is detected, report to handler and wait for new cookies.
+    Returns (html_text, is_captcha) after possibly waiting.
+    """
     headers = {
         'User-Agent': get_random_ua(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -135,24 +197,30 @@ def fetch_page(session, url):
         'DNT': '1',
         'Connection': 'keep-alive',
     }
-    try:
-        resp = session.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            print(R + f"[-] HTTP {resp.status_code} on {url}")
-            return None, False
-        return resp.text, detect_captcha(resp.text)
-    except Exception as e:
-        print(R + f"[-] Connection error: {e}")
-        return None, False
+    while True:
+        # Wait if a captcha is currently being handled globally
+        captcha_handler.wait_if_captcha()
 
-def update_session_cookies(session):
-    print(Y + "\n[!] CAPTCHA detected! Solve it in your browser and paste new cookies.")
-    new_str = input(W + "Paste new cookies (Format: PHPSESSID=...; ZHE=...): ").strip()
-    cookies = parse_cookies(new_str)
-    session.cookies.clear()
-    for k, v in cookies.items():
-        session.cookies.set(k, v)
-    print(G + "[+] Cookies updated. Retrying...")
+        try:
+            resp = session.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                print(R + f"[-] HTTP {resp.status_code} on {url}")
+                # Could be a temporary error, wait and retry
+                time.sleep(5)
+                continue
+            text = resp.text
+            if detect_captcha(text):
+                # Report captcha – this will block until resolved
+                captcha_handler.report_captcha()
+                # After resolution, update this session's cookies
+                captcha_handler.update_session_cookies(session)
+                # Loop will now retry the same URL with new cookies
+                continue
+            return text, False  # success, no captcha
+        except Exception as e:
+            print(R + f"[-] Connection error: {e}")
+            time.sleep(5)
+            continue
 
 def get_max_page_from_html(html):
     if not html: return 1
@@ -168,7 +236,8 @@ def save_all(filename, domain_set):
         for d in sorted(domain_set):
             f.write(d + '\n')
 
-def scrape_section(session, attacker, section_type, base_url):
+# ─────────────────── SCRAPE SECTION (per attacker/type) ─────────────────
+def scrape_section(session, attacker, section_type, base_url, captcha_handler):
     print(Y + f"\n[+] Starting {section_type} scrape for: {attacker}")
     filename = f"{attacker}_{section_type}.txt"
     open(filename, 'w').close()
@@ -180,33 +249,33 @@ def scrape_section(session, attacker, section_type, base_url):
         if max_page and page > max_page:
             print(G + f"[✓] Reached known max page ({max_page})")
             break
+
         url = base_url + f"/page={page}"
         print(W + f"[*] Fetching {section_type} page {page} ... ", end='', flush=True)
-        html, captcha = fetch_page(session, url)
-        if html is None:
-            print(R + "failed. Retrying after 5s...")
-            time.sleep(5)
-            continue
-        while captcha:
-            print(R + "CAPTCHA!")
-            update_session_cookies(session)
-            html, captcha = fetch_page(session, url)
-            if html is None:
-                print(R + "Retry after connection failure...")
-                time.sleep(5)
+
+        # Fetch with centralized captcha handling (may wait/retry inside)
+        html, _ = fetch_page(session, url, captcha_handler)
+
+        # Parse domains
         if BS_AVAILABLE:
             new_domains = extract_domains_soup(html)
         else:
             new_domains = extract_domains_regex(html)
+
         before = len(all_domains)
         all_domains.update(new_domains)
         added = len(all_domains) - before
         print(G + f"{len(new_domains)} domains found, {added} new unique")
+
+        # Real-time save
         save_all(filename, all_domains)
+
+        # Update max page
         current_max = get_max_page_from_html(html)
         if max_page is None or current_max > max_page:
             max_page = current_max
             print(C + f"[i] Max page updated to {max_page}")
+
         page += 1
         time.sleep(random.uniform(1.0, 2.5))
 
@@ -215,23 +284,27 @@ def scrape_section(session, attacker, section_type, base_url):
     print(W + f"[*] Saved to {filename}")
     return total
 
-def process_attacker(attacker, cookies, choice):
-    """Single attacker worker for threading."""
+# ─────────────────── ATTACKER WORKER (per attacker) ────────────────────
+def process_attacker(attacker, captcha_handler, choice):
+    """Scrape one attacker using shared captcha handler."""
     session = requests.session()
-    for k, v in cookies.items():
-        session.cookies.set(k, v)
+    # Initialize with current global cookies
+    captcha_handler.update_session_cookies(session)
 
     total_pub = 0
     total_unpub = 0
+
     if choice in ('1', '3'):
         total_pub = scrape_section(
             session, attacker, 'published',
-            f"http://www.zone-h.org/archive/notifier={attacker}"
+            f"http://www.zone-h.org/archive/notifier={attacker}",
+            captcha_handler
         )
     if choice in ('2', '3'):
         total_unpub = scrape_section(
             session, attacker, 'unpublished',
-            f"http://www.zone-h.org/archive/special={attacker}"
+            f"http://www.zone-h.org/archive/special={attacker}",
+            captcha_handler
         )
     if choice == '3':
         combined = set()
@@ -242,8 +315,10 @@ def process_attacker(attacker, cookies, choice):
         combo_file = f"{attacker}_all_domains.txt"
         save_all(combo_file, combined)
         print(G + f"[✓] Combined for {attacker}: {len(combined)} domains")
+
     return attacker, total_pub, total_unpub
 
+# ───────────────────────────── MAIN ─────────────────────────────────────
 def main():
     banner()
     print(Y + "Make sure you have valid Zone‑H session cookies.\n")
@@ -268,21 +343,22 @@ def main():
     else:
         print(R + "[!] Invalid mode."); sys.exit(1)
 
-    # Cookie input
-    while True:
-        cookie_str = input(W + "Paste full cookie string (PHPSESSID=...; ZHE=...): ").strip()
-        cookies = parse_cookies(cookie_str)
-        if 'PHPSESSID' in cookies and 'ZHE' in cookies:
-            break
+    # Cookie input (first time)
+    cookie_str = input(W + "Paste full cookie string (PHPSESSID=...; ZHE=...): ").strip()
+    initial_cookies = parse_cookies(cookie_str)
+    while 'PHPSESSID' not in initial_cookies or 'ZHE' not in initial_cookies:
         print(R + "[!] Must contain PHPSESSID and ZHE. Try again.")
+        cookie_str = input(W + "Paste full cookie string: ").strip()
+        initial_cookies = parse_cookies(cookie_str)
 
+    # Scrape type
     while True:
         choice = input(W + "\nScrape [1] Published  [2] Unpublished  [3] Both: ").strip()
         if choice in ('1','2','3'):
             break
         print(R + "Please enter 1, 2, or 3.")
 
-    # Threading option
+    # Threading option (if mass)
     use_threads = False
     max_workers = 1
     if len(attackers) > 1:
@@ -290,20 +366,23 @@ def main():
         if thr == 'y':
             try:
                 max_workers = int(input(W + "Number of threads (recommend 1-3): "))
-                if max_workers < 1: max_workers = 1
+                if max_workers < 1:
+                    max_workers = 1
                 use_threads = True
             except:
                 print(Y + "[!] Invalid, using single thread.")
                 use_threads = False
 
+    # Create centralized captcha handler with initial cookies
+    captcha_handler = CaptchaHandler(initial_cookies)
+
     # Test cookies
     print(C + "[*] Testing cookies...")
     test_sess = requests.session()
-    for k, v in cookies.items():
-        test_sess.cookies.set(k, v)
-    test_url = f"http://www.zone-h.org/archive/notifier=TesTAttacker"
-    test_html, test_cap = fetch_page(test_sess, test_url)
-    if test_html and not test_cap and 'defaceTime' in test_html:
+    test_sess.cookies.update(initial_cookies)
+    test_url = "http://www.zone-h.org/archive/notifier=TesTAttacker"
+    test_html, _ = fetch_page(test_sess, test_url, captcha_handler)
+    if test_html and 'defaceTime' in test_html:
         print(G + "[✓] Cookies valid.")
     else:
         print(Y + "[!] Could not verify, but continuing.")
@@ -311,14 +390,14 @@ def main():
     if not use_threads:
         # Sequential
         for attacker in attackers:
-            process_attacker(attacker, cookies, choice)
+            process_attacker(attacker, captcha_handler, choice)
     else:
-        # Multithreaded
+        # Multithreaded with shared captcha handler
         print(C + f"\n[*] Starting {max_workers} worker thread(s)...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(process_attacker, attacker, cookies, choice): attacker
-                for attacker in attackers
+                executor.submit(process_attacker, att, captcha_handler, choice): att
+                for att in attackers
             }
             for future in as_completed(futures):
                 attacker = futures[future]
